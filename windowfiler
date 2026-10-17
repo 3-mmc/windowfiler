@@ -1,0 +1,811 @@
+#!/usr/bin/env python3
+"""windowfiler: workspaces as manila folders, windows as filed sheets.
+
+  windowfiler          open the overview, or close it if it is open
+  windowfiler open     open it (e.g. three-finger swipe up)
+  windowfiler close    close it and switch to the highlighted window
+
+The folders stand side by side at the bottom of the screen, all turned to
+one angle. The current workspace's folder stands higher with its windows
+filed left to right, the highlighted one lifted. Click or scroll to leaf
+through, click the lifted sheet to switch to it, drag a sheet onto another
+folder to move the window to that workspace, click a folder to open it,
+double-click to go there. Keys: Left/Right leaf, Enter opens, 1-9 and
+PgUp/PgDn pick a folder, Esc leaves.
+
+Nothing runs while it is closed. On opening, windows on the current
+workspace are captured (scaled by the X server, one per frame after the
+first); windows elsewhere are unmapped and get a generic preview instead.
+
+X11 only (libwnck). Needs PyGObject, GTK 3, libwnck 3 and pycairo.
+https://github.com/3-mmc/windowfiler — MIT licence.
+"""
+import math, os, signal, sys, time
+
+PIDFILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "windowfiler.pid")
+
+
+def running_pid():
+    try:
+        pid = int(open(PIDFILE).read())
+        if b"windowfiler" in open(f"/proc/{pid}/cmdline", "rb").read():
+            return pid
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+# Talk to an open overview before paying ~200 ms for the GTK imports.
+if __name__ == "__main__":
+    CMD = sys.argv[1] if len(sys.argv) > 1 else "toggle"
+    if CMD == "--snapd":
+        sys.exit(0)          # the old background thumbnailer is retired
+    _pid = running_pid()
+    if _pid:
+        if CMD in ("toggle", "close"):
+            os.kill(_pid, signal.SIGUSR1 if CMD == "close" else signal.SIGTERM)
+        sys.exit(0)
+    if CMD == "close":
+        sys.exit(0)
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkX11", "3.0")
+gi.require_version("Wnck", "3.0")
+from gi.repository import Gtk, Gdk, GdkX11, GdkPixbuf, GLib, Wnck, Pango, PangoCairo
+import cairo
+
+THUMB_W = 480
+
+_lang = (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or
+         os.environ.get("LANG") or "")
+if _lang.startswith("de"):
+    T = {"title": "Arbeitsflächen", "workspace": "Arbeitsfläche {}",
+         "windows": "{} Fenster", "one_window": "1 Fenster", "minimized": "minimiert",
+         "hint": "← → / Mausrad blättern · Klick: wechseln · Ziehen auf einen Ordner: "
+                 "ablegen · Klick auf Ordner: öffnen · Doppelklick: hingehen · Esc"}
+else:
+    T = {"title": "Workspaces", "workspace": "Workspace {}",
+         "windows": "{} windows", "one_window": "1 window", "minimized": "minimized",
+         "hint": "← → / scroll to leaf through · click: switch · drag onto a folder: "
+                 "move there · click a folder: open · double-click: go there · Esc"}
+
+# IndigoMagic-Dark palette
+KHAKI, KHAKI_HI, KHAKI_LO = (0.647, 0.624, 0.502), (0.855, 0.843, 0.792), (0.357, 0.341, 0.275)
+KHAKI_BACK = (0.55, 0.525, 0.42)
+TEXT = (0.878, 0.878, 0.878)
+DIM = (0.54, 0.54, 0.54)
+RED = (0.929, 0.2, 0.231)
+YELLOW = (0.8, 0.8, 0.0)
+
+
+# ------------------------------------------------------------- thumbnails --
+def capture(win, ref):
+    """Scaled snapshot of a mapped window as a server-side surface.
+
+    The X server does the scaling (XRender), halving per pass so its bilinear
+    filter doesn't alias; only the small result ever exists. Returns
+    (surface, w, h) or None."""
+    try:
+        gw = GdkX11.X11Window.foreign_new_for_display(GdkX11.X11Display.get_default(),
+                                                      win.get_xid())
+        w, h = gw.get_width(), gw.get_height()
+        if w < 8 or h < 8:
+            return None
+        scale = min(1.0, THUMB_W / w)
+        tw, th = max(1, int(w * scale)), max(1, int(h * scale))
+        src, cw, ch = None, w, h
+        while True:
+            nw, nh = max(tw, cw // 2), max(th, ch // 2)
+            surf = ref.create_similar_surface(cairo.CONTENT_COLOR, nw, nh)
+            cr = cairo.Context(surf)
+            cr.scale(nw / cw, nh / ch)
+            if src is None:
+                Gdk.cairo_set_source_window(cr, gw, 0, 0)
+            else:
+                cr.set_source_surface(src, 0, 0)
+            cr.get_source().set_filter(cairo.FILTER_GOOD)
+            cr.paint()
+            src, cw, ch = surf, nw, nh
+            if (nw, nh) == (tw, th):
+                return surf, tw, th
+    except Exception:
+        return None
+
+
+def visible_now(win, screen):
+    ws = win.get_workspace()
+    return (not win.is_minimized() and
+            (ws is None or ws == screen.get_active_workspace()))
+
+
+# ---------------------------------------------------------------- drawing --
+def rounded(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def text(cr, s, x, y, w, size=9, bold=False, color=TEXT, align=Pango.Alignment.LEFT):
+    layout = PangoCairo.create_layout(cr)
+    layout.set_font_description(Pango.FontDescription(f"Sans {'Bold ' if bold else ''}{size}"))
+    layout.set_text(s, -1)
+    layout.set_width(int(w * Pango.SCALE))
+    layout.set_ellipsize(Pango.EllipsizeMode.END)
+    layout.set_alignment(align)
+    cr.set_source_rgb(*color)
+    cr.move_to(x, y)
+    PangoCairo.show_layout(cr, layout)
+
+
+def draw_pixbuf(cr, pb, x, y, w, h, alpha=1.0):
+    cr.save()
+    cr.translate(x, y)
+    cr.scale(w / pb.get_width(), h / pb.get_height())
+    Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
+    cr.get_source().set_filter(cairo.FILTER_GOOD)
+    cr.paint_with_alpha(alpha)
+    cr.restore()
+
+
+class Sheet:
+    REF = None    # the overview's GdkWindow: sheets are rendered server-side
+
+    def __init__(self, win, icon):
+        self.win, self.icon = win, icon
+        self.surface, self.size = None, None
+        self.rendered = {}   # height -> (surface, quad) of the askew sheet
+        self.box = None      # (x0, y0, x1, y1) hit box, set while drawing
+
+    def set_surface(self, surf, w, h):
+        self.surface, self.size = surf, (w, h)
+        self.rendered = {}
+
+    SHADOW = 8
+
+    def askew(self, h):
+        """The sheet facing left, rendered once per size."""
+        if h in self.rendered:
+            return self.rendered[h]
+        w = h * self.aspect * SHEET_SQUEEZE
+        far = h * SHEET_FAR
+        q = [(0, (h - far) / 2), (w, 0), (w, h), (0, (h + far) / 2)]
+        sw, shh = int(w + self.SHADOW + 2), int(h + self.SHADOW + 2)
+        if self.REF is not None:
+            surf = self.REF.create_similar_surface(cairo.CONTENT_COLOR_ALPHA, sw, shh)
+        else:
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, sw, shh)
+        cr = cairo.Context(surf)
+        cr.set_source_rgba(0, 0, 0, 0.4)
+        quad_path(cr, [(x + self.SHADOW, y + self.SHADOW) for x, y in q])
+        cr.fill()
+        alpha = 0.55 if self.win.is_minimized() else 1.0
+        if self.surface:
+            draw_quad_surface(cr, self.surface, q, alpha, 24)
+        else:
+            self.draw_generic(cr, q, w, h)
+        # the receding edge falls into shade
+        grad = cairo.LinearGradient(0, 0, w, 0)
+        grad.add_color_stop_rgba(0, 0, 0, 0, 0.45)
+        grad.add_color_stop_rgba(1, 0, 0, 0, 0)
+        cr.set_source(grad)
+        quad_path(cr, q)
+        cr.fill()
+        self.rendered[h] = (surf, q)
+        return self.rendered[h]
+
+    def draw_generic(self, cr, q, w, h):
+        """A window in miniature: khaki title bar with the name, dark body,
+        app icon."""
+        cr.set_source_rgb(0.227, 0.227, 0.227)
+        quad_path(cr, q)
+        cr.fill()
+        (x0, t0), (x1, t1), (_, b1), (_, b0) = q
+        bar_v = min(0.12, 30 / h)
+        bar = [(x0, t0), (x1, t1), (x1, lerp(t1, b1, bar_v)), (x0, lerp(t0, b0, bar_v))]
+        cr.set_source_rgb(*KHAKI)
+        quad_path(cr, bar)
+        cr.fill()
+        slope = (t1 - t0) / w
+        cr.save()
+        cr.transform(cairo.Matrix(1, slope, 0, 0.9, x0 + 8, t0 + 4))
+        text(cr, self.win.get_name(), 0, 0, w - 16, 9, True, (0.05, 0.05, 0.05))
+        cr.restore()
+        if self.icon:
+            size = min(64, h * 0.22, w * 0.5)
+            draw_pixbuf(cr, self.icon, (w - size) / 2, (h - size) / 2, size, size)
+        cr.set_source_rgb(0.1, 0.1, 0.1)
+        cr.set_line_width(1)
+        quad_path(cr, q)
+        cr.stroke()
+
+    @property
+    def aspect(self):
+        if self.size:
+            return self.size[0] / self.size[1]
+        g = self.win.get_geometry()
+        return max(0.5, min(2.5, g[2] / max(1, g[3])))
+
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+
+def ease(cur, target, k=0.22):
+    nxt = cur + (target - cur) * k
+    return target if abs(target - nxt) < 0.002 else nxt
+
+
+def quad_path(cr, q):
+    cr.move_to(*q[0])
+    for p in q[1:]:
+        cr.line_to(*p)
+    cr.close_path()
+
+
+# Every object is turned to the same angle as a filed sheet: a sheet of
+# height h is SHEET_SQUEEZE*h*aspect wide on screen and its far edge is
+# SHEET_FAR of the near one; folders are drawn with the same proportions.
+SHEET_SQUEEZE, SHEET_FAR = 0.46, 0.78
+
+
+class Persp:
+    """A panel turned like the sheets: across its width the left (far)
+    edge shrinks to SHEET_FAR of the right (near) one, about horizon cy."""
+    def __init__(self, x0, w, cy):
+        self.x0, self.w, self.cy = x0, w, cy
+
+    def s(self, x):
+        d = max(0.0, min(1.0, (self.x0 + self.w - x) / self.w))
+        return 1.0 - (1.0 - SHEET_FAR) * d
+
+    def pt(self, x, y):
+        return x, self.cy + (y - self.cy) * self.s(x)
+
+    def rect(self, cr, x, y, w, h):
+        quad_path(cr, [self.pt(x, y), self.pt(x + w, y), self.pt(x + w, y + h), self.pt(x, y + h)])
+
+    def text(self, cr, s, x, y, w, size, bold=False, color=TEXT):
+        slope = (y - self.cy) * (1.0 - SHEET_FAR) / self.w
+        X, Y = self.pt(x, y)
+        cr.save()
+        cr.transform(cairo.Matrix(1, slope, 0, self.s(x), X, Y))
+        text(cr, s, 0, 0, w, size, bold, color)
+        cr.restore()
+
+
+def inset(q, bu, bv):
+    """Shrink a quad (TL, TR, BR, BL with vertical side edges) inwards."""
+    (x0, t0), (x1, t1), (_, b1), (_, b0) = q
+    def at(u, v):
+        x = lerp(x0, x1, u)
+        return x, lerp(lerp(t0, t1, u), lerp(b0, b1, u), v)
+    return [at(bu, bv), at(1 - bu, bv), at(1 - bu, 1 - bv), at(bu, 1 - bv)]
+
+
+def draw_quad_surface(cr, surf, q, alpha=1.0, strips=36):
+    """Map an image onto a quad whose left/right edges are vertical, by
+    drawing it in vertical strips of varying height (fake perspective)."""
+    (x0, t0), (x1, t1), (_, b1), (_, b0) = q
+    iw, ih = surf.get_width(), surf.get_height()
+    flat = abs(t0 - t1) < 0.5 and abs(b0 - b1) < 0.5
+    n = 1 if flat else strips
+    for k in range(n):
+        u0, u1 = k / n, (k + 1) / n
+        xa, xb = lerp(x0, x1, u0), lerp(x0, x1, u1)
+        um = (u0 + u1) / 2
+        top, bot = lerp(t0, t1, um), lerp(b0, b1, um)
+        if xb - xa < 0.05 or bot - top < 1:
+            continue
+        sx0 = u0 * iw
+        sw = (u1 - u0) * iw
+        cr.save()
+        cr.rectangle(xa, top, xb - xa + (0.6 if n > 1 else 0), bot - top)
+        cr.clip()
+        cr.translate(xa, top)
+        cr.scale((xb - xa) / sw, (bot - top) / ih)
+        cr.set_source_surface(surf, -sx0, 0)
+        cr.get_source().set_filter(cairo.FILTER_GOOD)
+        cr.paint_with_alpha(alpha)
+        cr.restore()
+
+
+class TaskView(Gtk.Window):
+    """The overview: one folder per workspace, the current one open."""
+
+    def __init__(self):
+        super().__init__(title=T["title"])
+        self.set_decorated(False)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_keep_above(True)
+        self.set_app_paintable(True)
+        self.fullscreen()
+
+        self.screen = Wnck.Screen.get_default()
+        self.screen.force_update()
+        self.workspaces = self.screen.get_workspaces()
+        active = self.screen.get_active_workspace()
+        self.open_ws = active.get_number() if active else 0
+        self.sheets = {}
+        self.target = 0       # highlighted sheet index
+        self.lift = {}        # sheet -> 0..1 how far it pops out of the folder
+        self.scroll = 0.0     # horizontal scroll of the stack, animated
+        self.scroll_to = 0.0
+        self.rise = 0.0       # sheets sliding up out of the folder on open, 0..1
+        self.folders = []     # (ws number, rect) of closed folders
+        self.open_rect = None
+        self.hover = None
+        self.press = None
+        self.drag = None
+        self.ticking = False
+        self.collect()
+
+        area = Gtk.DrawingArea()
+        area.set_events(Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.BUTTON_PRESS_MASK |
+                        Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.SCROLL_MASK |
+                        Gdk.EventMask.SMOOTH_SCROLL_MASK)
+        area.connect("draw", self.on_draw)
+        area.connect("motion-notify-event", self.on_motion)
+        area.connect("button-press-event", self.on_press)
+        area.connect("button-release-event", self.on_release)
+        area.connect("scroll-event", self.on_scroll)
+        self.add(area)
+        self.area = area
+        self.connect("key-press-event", self.on_key)
+        self.connect("map-event", self.on_map)
+
+    # ---- model
+    def collect(self):
+        self.sheets = {ws.get_number(): [] for ws in self.workspaces}
+        active_win = self.screen.get_active_window()
+        # stacking order bottom..top, so the stack reads oldest-left, newest-right
+        for w in self.screen.get_windows_stacked():
+            if w.get_window_type() != Wnck.WindowType.NORMAL or w.is_skip_tasklist():
+                continue
+            ws = w.get_workspace()
+            targets = [ws.get_number()] if ws else list(self.sheets)
+            sheet = Sheet(w, w.get_icon())
+            for n in targets:
+                self.sheets.setdefault(n, []).append(sheet)
+        cur = self.sheets.get(self.open_ws, [])
+        for i, s in enumerate(cur):
+            if s.win == active_win:
+                self.target = i
+
+    def start_live(self):
+        """Capture what is on screen now, highlighted window first, one per
+        idle slot so the opening animation keeps its frames."""
+        seen, queue = set(), []
+        cur = self.sheets.get(self.open_ws, [])
+        first = [cur[self.target]] if cur and self.target < len(cur) else []
+        for sh in first + [x for lst in self.sheets.values() for x in lst]:
+            if id(sh) not in seen and visible_now(sh.win, self.screen):
+                seen.add(id(sh))
+                queue.append(sh)
+        self.live_queue = queue
+        GLib.idle_add(self.capture_next, priority=GLib.PRIORITY_LOW)
+
+    def capture_next(self):
+        if not self.live_queue:
+            return False
+        sh = self.live_queue.pop(0)
+        res = capture(sh.win, self.get_window())
+        if res:
+            sh.set_surface(*res)
+            self.area.queue_draw()
+        return bool(self.live_queue)
+
+    # ---- animation
+    def animate(self):
+        if not self.ticking:
+            self.ticking = True
+            self.area.add_tick_callback(self.on_tick)
+
+    def on_tick(self, widget, clock):
+        busy = False
+        for i, sh in enumerate(self.sheets.get(self.open_ws, [])):
+            want = 1.0 if i == self.target else 0.0
+            cur = self.lift.get(sh, 0.0)
+            nxt = ease(cur, want, 0.3)
+            self.lift[sh] = nxt
+            busy |= nxt != want
+        self.scroll = ease(self.scroll, self.scroll_to, 0.25)
+        self.rise = ease(self.rise, 1.0, 0.18)
+        widget.queue_draw()
+        if not busy and self.scroll == self.scroll_to and self.rise == 1.0 and not self.drag:
+            self.ticking = False
+            return False
+        return True
+
+    # ---- geometry
+    # The folders stand side by side, all turned to the sheets' angle and
+    # peeking up from the bottom edge: their fold is always below the screen.
+    # Inside a folder depth runs left (front) to right (back). The open folder
+    # stands a little higher and spreads its sheets out; closed ones are only
+    # as thick as the windows they hold.
+    PAD = 24             # flap/back panel to the first/last sheet
+    GAP = 36             # between folders
+    CLOSED_STEP = 12     # sheet spacing inside a closed folder
+    OPEN_LIFT = 64       # how much higher the open folder stands
+
+    def geometry(self, W, H):
+        g = {"W": W, "H": H}
+        g["sheet_h"] = min(480, H * 0.45)
+        g["panel_w"] = g["sheet_h"] * 1.6 * SHEET_SQUEEZE + 34
+        # folder floor below the screen edge, even for the lifted open folder
+        g["floor0"] = H + max(g["sheet_h"] * 0.22, self.OPEN_LIFT + 30)
+        g["pop"] = g["sheet_h"] * 0.42
+        return g
+
+    def layout(self, g):
+        """Front-flap x and sheet spacing for each folder, in drawer order."""
+        nums = [ws.get_number() for ws in self.workspaces]
+        counts = {n: len(self.sheets.get(n, [])) for n in nums}
+        closed_depth = lambda n: 2 * self.PAD + self.CLOSED_STEP * max(0, counts[n] - 1)
+        fixed = sum(closed_depth(n) for n in nums if n != self.open_ws)
+        fixed += self.GAP * (len(nums) - 1) + g["panel_w"] * len(nums) + 2 * self.PAD
+        avail = g["W"] - 120
+        n_open = counts.get(self.open_ws, 0)
+        spacing = 160
+        if n_open > 1:
+            spacing = max(60, min(160, (avail - fixed) / (n_open - 1)))
+        total = fixed + spacing * max(0, n_open - 1)
+        if total > avail:
+            # scroll so the highlighted sheet stays in view
+            pos = sum(closed_depth(n) + g["panel_w"] + self.GAP for n in nums if n < self.open_ws)
+            pos += self.PAD + self.target * spacing
+            self.scroll_to = max(0, min(total - avail, pos - avail / 2))
+        else:
+            self.scroll_to = 0
+        x = (g["W"] - min(total, avail)) / 2 - self.scroll
+        g["x_start"] = x
+        out = []
+        for n in nums:
+            step = spacing if n == self.open_ws else self.CLOSED_STEP
+            depth = 2 * self.PAD + step * max(0, counts[n] - 1)
+            out.append((n, x, step, depth))
+            x += depth + g["panel_w"] + self.GAP
+        return out
+
+    def floor(self, g, n):
+        return g["floor0"] - (self.OPEN_LIFT * self.rise if n == self.open_ws else 0)
+
+    # ---- painting
+    def on_draw(self, widget, cr):
+        W, H = widget.get_allocated_width(), widget.get_allocated_height()
+        g = self.geometry(W, H)
+        cr.set_source_rgb(0.07, 0.07, 0.07)
+        cr.paint()
+        grad = cairo.LinearGradient(0, H * 0.45, 0, H)
+        grad.add_color_stop_rgba(0, 0, 0, 0, 0)
+        grad.add_color_stop_rgba(1, 0.36, 0.34, 0.27, 0.35)
+        cr.set_source(grad)
+        cr.rectangle(0, H * 0.45, W, H)
+        cr.fill()
+
+        folders = self.layout(g)
+        self.folders = []
+        for s_ in self.sheets.get(self.open_ws, []):
+            s_.box = None
+        # back to front, so nearer folders cover the ones behind
+        for n, x, step, depth in reversed(folders):
+            self.draw_folder(cr, g, n, x, step, depth)
+        self.draw_title(cr, g, folders)
+
+        if self.drag:
+            s, x, y = self.drag
+            surf, _ = s.askew(200)
+            cr.set_source_surface(surf, x + 14, y + 14)
+            cr.paint_with_alpha(0.9)
+        hint = T["hint"]
+        text(cr, hint, 0, 22, W, 8, color=DIM, align=Pango.Alignment.CENTER)
+
+    def sheet_pos(self, g, n, x, step, i):
+        """Sheets are spaced by their near (right) edges, so the strip of
+        each that shows behind the one in front is the same width whatever
+        the window's shape."""
+        sheets = self.sheets.get(n, [])
+        h = g["sheet_h"]
+        wmax = max((sh.aspect for sh in sheets), default=1.6) * h * SHEET_SQUEEZE
+        w = sheets[i].aspect * h * SHEET_SQUEEZE
+        right = x + self.PAD + wmax + i * step
+        return right - w, self.floor(g, n) - 4
+
+    def draw_folder(self, cr, g, n, x, step, depth):
+        h, pw = g["sheet_h"], g["panel_w"]
+        is_open = n == self.open_ws
+        hot = self.hover == ("folder", n)
+        lift = -10 if (hot and not is_open) else 0
+        sheets = self.sheets.get(n, [])
+        xb = x + depth                              # back panel
+        fb = ff = self.floor(g, n) + 6 + lift
+        Pb = Persp(xb, pw, fb - h / 2)
+        Pf = Persp(x, pw, ff - h / 2)
+        back_h, flap_h = h * 1.14, h * 0.40     # back panel taller than the sheets, tab above
+
+        # back panel with its labelled tab on the near end; the tab sticks
+        # up above the folders in front, so every folder's name stays visible
+        tab_x, tab_w, tab_h = xb + pw * 0.40, pw * 0.56, 30
+        cr.set_source_rgb(*KHAKI_BACK)
+        Pb.rect(cr, xb, fb - back_h, pw, back_h)
+        cr.fill()
+        cr.set_source_rgb(*(KHAKI_HI if hot or is_open else KHAKI))
+        Pb.rect(cr, tab_x, fb - back_h - tab_h, tab_w, tab_h + 2)
+        cr.fill()
+        Pb.text(cr, self.ws_label(n), tab_x + 10, fb - back_h - tab_h + 7, tab_w - 16, 10, True,
+                RED if self.is_active(n) else (0.08, 0.08, 0.08))
+        # floor between the panels
+        cr.set_source_rgb(*KHAKI_LO)
+        quad_path(cr, [Pf.pt(x, ff), Pf.pt(x + pw, ff), Pb.pt(xb + pw, fb), Pb.pt(xb, fb)])
+        cr.fill()
+
+        # sheets back to front (higher index is further back). The highlighted
+        # one is only lifted: it keeps its place, so sheets in front of it and
+        # the front flap still cover it
+        sink = (1 - self.rise) * h * 0.6 if is_open else 0
+        for i in range(len(sheets) - 1, -1, -1):
+            s = sheets[i]
+            if is_open and self.drag and self.drag[0] is s:
+                continue
+            sx, sb = self.sheet_pos(g, n, x, step, i)
+            up = self.lift.get(s, 0.0) * g["pop"] if is_open else 0
+            self.draw_sheet(cr, s, sx, sb - h - up + sink + lift, h, i if is_open else -1)
+
+        # front flap, darker where it recedes
+        grad = cairo.LinearGradient(x, 0, x + pw, 0)
+        grad.add_color_stop_rgb(0, *[c * 0.78 for c in KHAKI])
+        grad.add_color_stop_rgb(1, *KHAKI)
+        cr.set_source_rgba(0, 0, 0, 0.35)
+        Pf.rect(cr, x + 5, ff - flap_h + 5, pw, flap_h)
+        cr.fill()
+        cr.set_source(grad)
+        Pf.rect(cr, x, ff - flap_h, pw, flap_h)
+        cr.fill()
+        cr.set_source_rgb(*KHAKI_HI)
+        Pf.rect(cr, x, ff - flap_h, pw, 2)
+        cr.fill()
+        if hot and self.drag:
+            cr.set_source_rgb(*YELLOW)
+            cr.set_line_width(2)
+            Pf.rect(cr, x, ff - flap_h, pw, flap_h)
+            cr.stroke()
+        count = T["windows"].format(len(sheets)) if len(sheets) != 1 else T["one_window"]
+        if is_open and sheets:
+            count += f"  ·  {self.target + 1} / {len(sheets)}"
+        Pf.text(cr, count, x + pw * 0.34, ff - flap_h + 16, pw * 0.62, 10, True, KHAKI_LO)
+
+        if is_open:
+            self.open_rect = (x, fb - back_h - tab_h, xb + pw - x, ff - (fb - back_h - tab_h))
+        else:
+            self.folders.append((n, (x, fb - back_h - tab_h, xb + pw - x, g["H"] - (fb - back_h - tab_h))))
+
+    def draw_title(self, cr, g, folders):
+        """Label above the highlighted sheet (an overlay, not part of the scene)."""
+        sheets = self.sheets.get(self.open_ws, [])
+        if not sheets or self.target >= len(sheets):
+            return
+        s = sheets[self.target]
+        if self.drag and self.drag[0] is s:
+            return
+        x, step = next((fx, st) for n, fx, st, _ in folders if n == self.open_ws)
+        h = g["sheet_h"]
+        sx, sb = self.sheet_pos(g, self.open_ws, x, step, self.target)
+        y = sb - h - self.lift.get(s, 0.0) * g["pop"] + (1 - self.rise) * h * 0.6
+        _, q = s.askew(h)
+        slope = (q[1][1] - q[0][1]) / q[1][0]
+        title = s.win.get_name() + (f"  ({T['minimized']})" if s.win.is_minimized() else "")
+        cr.save()
+        cr.transform(cairo.Matrix(1, slope, 0, 1, sx, y + q[0][1] - 30))
+        if s.icon:
+            draw_pixbuf(cr, s.icon, 0, 0, 20, 20)
+        text(cr, title, 28, 1, 520, 11, True)
+        cr.restore()
+
+    def draw_sheet(self, cr, s, x, y, h, index):
+        surf, q = s.askew(h)
+        cr.set_source_surface(surf, x, y)
+        cr.paint()
+        if index < 0:
+            return
+        s.box = (x, y, x + q[1][0], y + h)
+        if index == self.target or self.hover == ("sheet", s):
+            cr.set_source_rgb(*(YELLOW if index == self.target else KHAKI_HI))
+            cr.set_line_width(2)
+            quad_path(cr, [(x + px, y + py) for px, py in q])
+            cr.stroke()
+
+    def ws_label(self, n):
+        name = self.workspaces[n].get_name() if n < len(self.workspaces) else str(n + 1)
+        return T["workspace"].format(name) if name.isdigit() else name
+
+    def is_active(self, n):
+        a = self.screen.get_active_workspace()
+        return a is not None and a.get_number() == n
+
+    # ---- hit testing
+    def hit(self, x, y):
+        sheets = self.sheets.get(self.open_ws, [])
+        for i in range(len(sheets)):          # front to back, like the drawing
+            b = sheets[i].box
+            if b and b[0] <= x <= b[2] and b[1] <= y <= b[3]:
+                return ("sheet", sheets[i])
+        # nearer (left) folders first
+        for n, (fx, fy, fw, fh) in sorted(self.folders, key=lambda f: f[1][0]):
+            if fx <= x <= fx + fw and fy <= y <= fy + fh:
+                return ("folder", n)
+        if self.open_rect:
+            ox, oy, ow, oh = self.open_rect
+            if ox <= x <= ox + ow and oy <= y <= oy + oh:
+                return ("openfolder", self.open_ws)
+        return None
+
+    def on_motion(self, w, ev):
+        if self.press and not self.drag and self.press[0] and self.press[0][0] == "sheet" and \
+                abs(ev.x - self.press[1]) + abs(ev.y - self.press[2]) > 12:
+            self.drag = (self.press[0][1], ev.x, ev.y)
+        if self.drag:
+            self.drag = (self.drag[0], ev.x, ev.y)
+        hit = self.hit(ev.x, ev.y)
+        if self.drag and hit and hit[0] != "folder":
+            hit = None
+        if hit != self.hover or self.drag:
+            self.hover = hit
+            self.area.queue_draw()
+
+    def on_scroll(self, w, ev):
+        ok, dx, dy = ev.get_scroll_deltas()
+        if ev.direction in (Gdk.ScrollDirection.UP, Gdk.ScrollDirection.LEFT) or (ok and dy + dx < -0.3):
+            self.move_focus(-1)
+        elif ev.direction in (Gdk.ScrollDirection.DOWN, Gdk.ScrollDirection.RIGHT) or (ok and dy + dx > 0.3):
+            self.move_focus(1)
+        return True
+
+    def on_press(self, w, ev):
+        hit = self.hit(ev.x, ev.y)
+        if ev.type == Gdk.EventType._2BUTTON_PRESS and hit and hit[0] in ("folder", "openfolder"):
+            self.go_workspace(hit[1], ev.time)
+            return
+        if ev.type == Gdk.EventType.BUTTON_PRESS:
+            self.press = (hit, ev.x, ev.y)
+
+    def on_release(self, w, ev):
+        press, self.press = self.press, None
+        if self.drag:
+            s = self.drag[0]
+            self.drag = None
+            hit = self.hit(ev.x, ev.y)
+            if hit and hit[0] == "folder":
+                s.win.move_to_workspace(self.workspaces[hit[1]])
+                self.sheets[self.open_ws].remove(s)
+                self.sheets[hit[1]].append(s)
+                self.target = max(0, min(self.target, len(self.sheets[self.open_ws]) - 1))
+            self.hover = None
+            self.animate()
+            return
+        if press is None:
+            return
+        hit = press[0]
+        if hit is None:
+            self.quit()
+        elif hit[0] == "folder":
+            self.open_folder(hit[1])
+        elif hit[0] == "sheet":
+            sheets = self.sheets[self.open_ws]
+            i = sheets.index(hit[1])
+            if i == self.target:
+                self.activate(hit[1], ev.time)
+            else:
+                self.target = i
+                self.animate()
+
+    # ---- actions
+    def move_focus(self, step):
+        n = len(self.sheets.get(self.open_ws, []))
+        if n:
+            self.target = max(0, min(n - 1, self.target + step))
+            self.animate()
+
+    def open_folder(self, n):
+        if n != self.open_ws:
+            self.open_ws = n
+            sheets = self.sheets.get(n, [])
+            self.target = max(0, len(sheets) - 1)   # topmost window first
+            self.lift = {}
+            self.scroll = self.scroll_to = 0.0
+            self.rise = 0.0
+            self.hover = None
+            self.animate()
+
+    def activate(self, s, ts):
+        win = s.win
+        ws = win.get_workspace()
+        self.quit()
+        if ws and ws != self.screen.get_active_workspace():
+            ws.activate(ts)
+        win.activate(ts)
+
+    def go_workspace(self, n, ts):
+        self.quit()
+        self.workspaces[n].activate(ts)
+
+    def on_key(self, w, ev):
+        sheets = self.sheets.get(self.open_ws, [])
+        key = ev.keyval
+        if key == Gdk.KEY_Escape:
+            self.quit()
+        elif key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space, Gdk.KEY_Up):
+            if sheets:
+                self.activate(sheets[self.target], ev.time)
+            else:
+                self.go_workspace(self.open_ws, ev.time)
+        elif key in (Gdk.KEY_Right, Gdk.KEY_Tab):
+            self.move_focus(1)
+        elif key in (Gdk.KEY_Left, Gdk.KEY_ISO_Left_Tab):
+            self.move_focus(-1)
+        elif Gdk.KEY_1 <= key <= Gdk.KEY_9 and key - Gdk.KEY_1 < len(self.workspaces):
+            self.open_folder(key - Gdk.KEY_1)
+        elif key == Gdk.KEY_Page_Down:
+            self.open_folder((self.open_ws + 1) % len(self.workspaces))
+        elif key == Gdk.KEY_Page_Up:
+            self.open_folder((self.open_ws - 1) % len(self.workspaces))
+        else:
+            return False
+        return True
+
+    # ---- lifetime
+    def on_map(self, *a):
+        Sheet.REF = self.get_window()
+        GLib.timeout_add(30, self.try_grab, 0)
+        self.start_live()
+        self.animate()
+
+    def close_focused(self, *a):
+        """Gesture close: switch to the highlighted window (or this folder)."""
+        ts = GdkX11.x11_get_server_time(self.get_window())
+        sheets = self.sheets.get(self.open_ws, [])
+        if sheets and self.target < len(sheets):
+            self.activate(sheets[self.target], ts)
+        else:
+            self.go_workspace(self.open_ws, ts)
+        return True
+
+    def try_grab(self, tries):
+        seat = Gdk.Display.get_default().get_default_seat()
+        ok = seat.grab(self.get_window(), Gdk.SeatCapabilities.ALL, True,
+                       None, None, None, None) == Gdk.GrabStatus.SUCCESS
+        if not ok and tries < 40:
+            GLib.timeout_add(30, self.try_grab, tries + 1)
+        return False
+
+    def quit(self, *a):
+        try:
+            os.unlink(PIDFILE)
+        except OSError:
+            pass
+        self.hide()
+        Gtk.main_quit()
+        return True
+
+
+def main():
+    open(PIDFILE, "w").write(str(os.getpid()))
+    win = TaskView()
+    win.show_all()
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        add = GLibUnix.signal_add
+    except (ImportError, ValueError):
+        add = GLib.unix_signal_add
+    add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, win.quit)
+    add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, win.close_focused)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
