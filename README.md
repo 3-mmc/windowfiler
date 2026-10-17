@@ -3,6 +3,8 @@
 A workspace overview for X11 desktops, drawn as a filing drawer: every
 workspace is a manila folder, every window a sheet filed inside it.
 
+![windowfiler: three workspace folders, the open one with four windows filed in it](screenshot.png)
+
 The folders stand side by side along the bottom of the screen, all turned to
 the same angle. The current workspace's folder stands a little higher with its
 windows filed left to right; the highlighted window is lifted half out of the
